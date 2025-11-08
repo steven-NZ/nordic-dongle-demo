@@ -1,0 +1,73 @@
+# Zephyr build outputs
+build/
+build*/
+twister-out/
+Testing/
+outdir/
+
+# West workspace
+.west/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compilation artifacts
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+*.d
+
+# Zephyr specific
+zephyr.dts
+zephyr.dts.pre
+*.pre.tmp
+zephyr/.config.sysbuild
+zephyr/.config.sysbuild.old
+.cache/
+
+# Nordic specific
+*.jlink
+*.out
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*~
