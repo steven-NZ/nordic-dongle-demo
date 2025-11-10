@@ -165,10 +165,11 @@ int esb_initialize(void)
 	struct esb_config config = ESB_DEFAULT_CONFIG;
 
 	config.protocol = ESB_PROTOCOL_ESB_DPL;
-	config.bitrate = ESB_BITRATE_2MBPS;
+	config.bitrate = ESB_BITRATE_1MBPS;  /* 1Mbps for maximum range */
 	config.mode = ESB_MODE_PRX;
 	config.event_handler = event_handler;
 	config.selective_auto_ack = true;
+	config.tx_output_power = ESB_TX_POWER_8DBM;  /* Maximum +8dBm for nRF52840 */
 	if (IS_ENABLED(CONFIG_ESB_FAST_SWITCHING)) {
 		config.use_fast_ramp_up = true;
 	}
