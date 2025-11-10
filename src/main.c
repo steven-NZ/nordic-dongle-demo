@@ -14,7 +14,6 @@
 #include <esb.h>
 #include <zephyr/kernel.h>
 #include <zephyr/types.h>
-#include <dk_buttons_and_leds.h>
 #if defined(CONFIG_CLOCK_CONTROL_NRF2)
 #include <hal/nrf_lrcconf.h>
 #endif
@@ -32,15 +31,15 @@ static struct esb_payload rx_payload;
 static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
 	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17);
 
+/* LED for nrf52840dongle */
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static bool led_on = false;
+
 static void leds_update(uint8_t value)
 {
-	uint32_t leds_mask =
-		(!(value % 8 > 0 && value % 8 <= 4) ? DK_LED1_MSK : 0) |
-		(!(value % 8 > 1 && value % 8 <= 5) ? DK_LED2_MSK : 0) |
-		(!(value % 8 > 2 && value % 8 <= 6) ? DK_LED3_MSK : 0) |
-		(!(value % 8 > 3) ? DK_LED4_MSK : 0);
-
-	dk_set_leds(leds_mask);
+	/* Toggle LED to indicate packet reception */
+	led_on = !led_on;
+	gpio_pin_set_dt(&led, led_on);
 }
 
 void event_handler(struct esb_evt const *event)
@@ -208,9 +207,14 @@ int main(void)
 		return 0;
 	}
 
-	err = dk_leds_init();
+	/* Initialize LED for dongle */
+	if (!gpio_is_ready_dt(&led)) {
+		LOG_ERR("LED GPIO device not ready");
+		return 0;
+	}
+	err = gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 	if (err) {
-		LOG_ERR("LEDs initialization failed, err %d", err);
+		LOG_ERR("LED GPIO configuration failed, err %d", err);
 		return 0;
 	}
 
