@@ -25,6 +25,12 @@
 #include <hal/nrf_clock.h>
 #endif /* defined(NRF54LM20A_ENGA_XXAA) */
 
+/* USB HID includes */
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/usb/class/usb_hid.h>
+#include <zephyr/sys/util.h>
+#include <string.h>
+
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 static struct esb_payload rx_payload;
@@ -35,11 +41,54 @@ static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static bool led_on = false;
 
+/* USB HID Mouse definitions */
+#define MOUSE_BTN_REPORT_IDX	0
+#define MOUSE_X_REPORT_IDX	1
+#define MOUSE_Y_REPORT_IDX	2
+#define MOUSE_WHEEL_REPORT_IDX	3
+#define MOUSE_REPORT_COUNT	4
+
+/* HID Report Descriptor for a simple 3-byte mouse (buttons, X, Y) */
+static const uint8_t hid_report_desc[] = HID_MOUSE_REPORT_DESC(2);
+
+static enum usb_dc_status_code usb_status;
+static const struct device *hid_dev;
+
+/* Message queue for mouse reports */
+K_MSGQ_DEFINE(mouse_msgq, MOUSE_REPORT_COUNT, 8, 4);
+static K_SEM_DEFINE(ep_write_sem, 0, 1);
+
 static void leds_update(uint8_t value)
 {
 	/* Toggle LED to indicate packet reception */
 	led_on = !led_on;
 	gpio_pin_set_dt(&led, led_on);
+}
+
+/* USB HID callback functions */
+static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
+{
+	usb_status = status;
+}
+
+static void int_in_ready_cb(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	k_sem_give(&ep_write_sem);
+}
+
+static const struct hid_ops ops = {
+	.int_in_ready = int_in_ready_cb,
+};
+
+/* Function to send mouse movement report */
+static void send_mouse_report(int8_t x, int8_t y, uint8_t buttons)
+{
+	uint8_t report[MOUSE_REPORT_COUNT] = {buttons, x, y, 0};
+
+	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
+		LOG_WRN("Failed to queue mouse report");
+	}
 }
 
 void event_handler(struct esb_evt const *event)
@@ -59,6 +108,15 @@ void event_handler(struct esb_evt const *event)
 				rx_payload.data[0]);
 
 			leds_update(rx_payload.data[0]);
+
+			/* If received byte is 'A', perform a left mouse click */
+			if (rx_payload.data[0] == 'A') {
+				LOG_INF("Performing left click");
+				/* Press left button */
+				send_mouse_report(0, 0, 0x01);
+				/* Release left button */
+				send_mouse_report(0, 0, 0x00);
+			}
 		} else {
 			LOG_ERR("Error while reading rx packet");
 		}
@@ -197,7 +255,7 @@ int main(void)
 {
 	int err;
 
-	LOG_INF("Enhanced ShockBurst prx sample");
+	LOG_INF("Nordic AirPad Sample");
 
 	err = clocks_start();
 	if (err) {
@@ -237,6 +295,59 @@ int main(void)
 		return 0;
 	}
 
-	/* return to idle thread */
+	/* Initialize USB HID */
+	hid_dev = device_get_binding("HID_0");
+	if (hid_dev == NULL) {
+		LOG_ERR("Cannot get USB HID Device");
+		return 0;
+	}
+
+	usb_hid_register_device(hid_dev,
+				hid_report_desc, sizeof(hid_report_desc),
+				&ops);
+
+	err = usb_hid_init(hid_dev);
+	if (err) {
+		LOG_ERR("Failed to initialize USB HID, err %d", err);
+		return 0;
+	}
+
+	err = usb_enable(status_cb);
+	if (err != 0) {
+		LOG_ERR("Failed to enable USB, err %d", err);
+		return 0;
+	}
+
+	LOG_INF("USB HID Mouse initialized - ESB packets will left click mouse");
+
+	/* Main loop: process USB HID mouse reports */
+	while (true) {
+		uint8_t report[MOUSE_REPORT_COUNT];
+
+		/* Wait for mouse report from ESB event handler */
+		err = k_msgq_get(&mouse_msgq, &report, K_FOREVER);
+		if (err) {
+			LOG_ERR("Failed to get report from queue: %d", err);
+			continue;
+		}
+
+		LOG_INF("Sending HID report: btn=%d, x=%d, y=%d, wheel=%d",
+			report[MOUSE_BTN_REPORT_IDX],
+			(int8_t)report[MOUSE_X_REPORT_IDX],
+			(int8_t)report[MOUSE_Y_REPORT_IDX],
+			(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
+
+		/* Send HID report over USB */
+		err = hid_int_ep_write(hid_dev, report, MOUSE_REPORT_COUNT, NULL);
+		if (err) {
+			LOG_ERR("HID write error, %d", err);
+		} else {
+			LOG_DBG("HID write successful, waiting for endpoint ready");
+			/* Wait for endpoint to be ready */
+			k_sem_take(&ep_write_sem, K_FOREVER);
+			LOG_DBG("Endpoint ready");
+		}
+	}
+
 	return 0;
 }
