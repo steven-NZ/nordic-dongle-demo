@@ -45,7 +45,8 @@ static bool led_on = false;
 #define MOUSE_BTN_REPORT_IDX	0
 #define MOUSE_X_REPORT_IDX	1
 #define MOUSE_Y_REPORT_IDX	2
-#define MOUSE_REPORT_COUNT	3
+#define MOUSE_WHEEL_REPORT_IDX	3
+#define MOUSE_REPORT_COUNT	4
 
 /* HID Report Descriptor for a simple 3-byte mouse (buttons, X, Y) */
 static const uint8_t hid_report_desc[] = HID_MOUSE_REPORT_DESC(2);
@@ -83,7 +84,7 @@ static const struct hid_ops ops = {
 /* Function to send mouse movement report */
 static void send_mouse_report(int8_t x, int8_t y, uint8_t buttons)
 {
-	uint8_t report[MOUSE_REPORT_COUNT] = {buttons, x, y};
+	uint8_t report[MOUSE_REPORT_COUNT] = {buttons, x, y, 0};  /* 4th byte is wheel (0 = no scroll) */
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
 		LOG_WRN("Failed to queue mouse report");
@@ -326,16 +327,25 @@ int main(void)
 		/* Wait for mouse report from ESB event handler */
 		err = k_msgq_get(&mouse_msgq, &report, K_FOREVER);
 		if (err) {
+			LOG_ERR("Failed to get report from queue: %d", err);
 			continue;
 		}
+
+		LOG_INF("Sending HID report: btn=%d, x=%d, y=%d, wheel=%d",
+			report[MOUSE_BTN_REPORT_IDX],
+			(int8_t)report[MOUSE_X_REPORT_IDX],
+			(int8_t)report[MOUSE_Y_REPORT_IDX],
+			(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
 
 		/* Send HID report over USB */
 		err = hid_int_ep_write(hid_dev, report, MOUSE_REPORT_COUNT, NULL);
 		if (err) {
 			LOG_ERR("HID write error, %d", err);
 		} else {
+			LOG_DBG("HID write successful, waiting for endpoint ready");
 			/* Wait for endpoint to be ready */
 			k_sem_take(&ep_write_sem, K_FOREVER);
+			LOG_DBG("Endpoint ready");
 		}
 	}
 
