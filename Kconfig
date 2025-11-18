@@ -4,6 +4,9 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+# Source common USB sample options (for new USB device stack support)
+rsource "$(ZEPHYR_BASE)/samples/subsys/usb/common/Kconfig.sample_usbd"
+
 source "Kconfig.zephyr"
 
 menu "Enhanced ShockBurst: Receiver"
