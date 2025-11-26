@@ -53,13 +53,55 @@ static bool led_on = false;
 
 /* USB HID Mouse definitions */
 #define MOUSE_BTN_REPORT_IDX	0
-#define MOUSE_X_REPORT_IDX	1
-#define MOUSE_Y_REPORT_IDX	2
-#define MOUSE_WHEEL_REPORT_IDX	3
-#define MOUSE_REPORT_COUNT	4
+#define MOUSE_X_LOW_IDX		1	/* X position low byte */
+#define MOUSE_X_HIGH_IDX	2	/* X position high byte */
+#define MOUSE_Y_LOW_IDX		3	/* Y position low byte */
+#define MOUSE_Y_HIGH_IDX	4	/* Y position high byte */
+#define MOUSE_REPORT_COUNT	5
 
-/* HID Report Descriptor for a simple 3-byte mouse (buttons, X, Y) */
-static const uint8_t hid_report_desc[] = HID_MOUSE_REPORT_DESC(2);
+/* HID Report Descriptor for absolute positioning digitizer */
+static const uint8_t hid_report_desc[] = {
+	0x05, 0x01,        // Usage Page (Generic Desktop)
+	0x09, 0x02,        // Usage (Mouse)
+	0xA1, 0x01,        // Collection (Application)
+	0x09, 0x01,        //   Usage (Pointer)
+	0xA1, 0x00,        //   Collection (Physical)
+
+	// Button bits (3 buttons)
+	0x05, 0x09,        //     Usage Page (Buttons)
+	0x19, 0x01,        //     Usage Minimum (Button 1)
+	0x29, 0x03,        //     Usage Maximum (Button 3)
+	0x15, 0x00,        //     Logical Minimum (0)
+	0x25, 0x01,        //     Logical Maximum (1)
+	0x95, 0x03,        //     Report Count (3)
+	0x75, 0x01,        //     Report Size (1 bit)
+	0x81, 0x02,        //     Input (Data, Variable, Absolute)
+
+	// Padding to byte boundary
+	0x95, 0x01,        //     Report Count (1)
+	0x75, 0x05,        //     Report Size (5 bits)
+	0x81, 0x01,        //     Input (Constant) - padding
+
+	// X Position (Absolute, 16-bit, 0-32767)
+	0x05, 0x01,        //     Usage Page (Generic Desktop)
+	0x09, 0x30,        //     Usage (X)
+	0x15, 0x00,        //     Logical Minimum (0)
+	0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
+	0x75, 0x10,        //     Report Size (16 bits)
+	0x95, 0x01,        //     Report Count (1)
+	0x81, 0x02,        //     Input (Data, Variable, Absolute)
+
+	// Y Position (Absolute, 16-bit, 0-32767)
+	0x09, 0x31,        //     Usage (Y)
+	0x15, 0x00,        //     Logical Minimum (0)
+	0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
+	0x75, 0x10,        //     Report Size (16 bits)
+	0x95, 0x01,        //     Report Count (1)
+	0x81, 0x02,        //     Input (Data, Variable, Absolute)
+
+	0xC0,              //   End Collection (Physical)
+	0xC0               // End Collection (Application)
+};
 
 static enum usb_dc_status_code usb_status;
 static const struct device *hid_dev;
@@ -97,33 +139,78 @@ static void quat_to_euler(float qw, float qx, float qy, float qz,
 }
 
 /**
- * Convert Euler angles to mouse displacement with deadzone and scaling.
+ * Convert Euler angles to absolute screen position with smoothing.
+ *
+ * @param roll Roll angle in radians (maps to X position, inverted)
+ * @param pitch Pitch angle in radians (maps to Y position)
+ * @param abs_x Output: absolute X coordinate (0-32767, screen center = 16383)
+ * @param abs_y Output: absolute Y coordinate (0-32767, screen center = 16383)
  */
-static void euler_to_mouse_displacement(float roll, float pitch,
-                                        int8_t *mouse_x, int8_t *mouse_y)
+static void euler_to_absolute_position(float roll, float pitch,
+                                       uint16_t *abs_x, uint16_t *abs_y)
 {
-	const float DEADZONE = 0.05f;      /* ±0.05 radians (~±3 degrees) */
-	const float SENSITIVITY = 20.0f;   /* displacement = angle * 20 */
+	const float CENTER_DEADZONE = 0.0f;    /* ±5° in radians (increased for stability) */
+	const float MAX_ANGLE = 1.0472f;          /* ±60° in radians */
+	const uint16_t SCREEN_CENTER = 16383;     /* Center of 0-32767 range */
+	const uint16_t SCREEN_MAX = 32767;
+	const float SMOOTHING_FACTOR = 0.5f;      /* 0.0 = no smoothing, 1.0 = max smoothing */
 
-	/* Apply deadzone to roll (X-axis) */
-	float roll_filtered = (fabsf(roll) < DEADZONE) ? 0.0f : roll;
+	/* Static variables to store previous smoothed values */
+	static float roll_smoothed = 0.0f;
+	static float pitch_smoothed = 0.0f;
 
-	/* Apply deadzone to pitch (Y-axis) */
-	float pitch_filtered = (fabsf(pitch) < DEADZONE) ? 0.0f : pitch;
+	/* Exponential smoothing filter to reduce jitter */
+	roll_smoothed = roll_smoothed * SMOOTHING_FACTOR + roll * (1.0f - SMOOTHING_FACTOR);
+	pitch_smoothed = pitch_smoothed * SMOOTHING_FACTOR + pitch * (1.0f - SMOOTHING_FACTOR);
 
-	/* Scale angles to mouse displacement */
-	float x_float = roll_filtered * SENSITIVITY;
-	float y_float = pitch_filtered * SENSITIVITY;
+	/* Apply center deadzone with smooth transition */
+	float roll_active, pitch_active;
 
-	/* Clamp to int8_t range (-128 to +127) */
-	if (x_float > 127.0f) x_float = 127.0f;
-	if (x_float < -128.0f) x_float = -128.0f;
-	if (y_float > 127.0f) y_float = 127.0f;
-	if (y_float < -128.0f) y_float = -128.0f;
+	if (fabsf(roll_smoothed) < CENTER_DEADZONE) {
+		roll_active = 0.0f;
+	} else {
+		/* Remove deadzone offset for smooth transition */
+		roll_active = roll_smoothed - (roll_smoothed > 0 ? CENTER_DEADZONE : -CENTER_DEADZONE);
+	}
 
-	/* Convert to int8_t (invert X axis) */
-	*mouse_x = -(int8_t)x_float;
-	*mouse_y = (int8_t)y_float;
+	if (fabsf(pitch_smoothed) < CENTER_DEADZONE) {
+		pitch_active = 0.0f;
+	} else {
+		/* Remove deadzone offset for smooth transition */
+		pitch_active = pitch_smoothed - (pitch_smoothed > 0 ? CENTER_DEADZONE : -CENTER_DEADZONE);
+	}
+
+	/* Adjust max angle to account for deadzone offset */
+	const float EFFECTIVE_MAX_ANGLE = MAX_ANGLE - CENTER_DEADZONE;
+
+	/* Clamp angles to effective range */
+	if (roll_active > EFFECTIVE_MAX_ANGLE) roll_active = EFFECTIVE_MAX_ANGLE;
+	if (roll_active < -EFFECTIVE_MAX_ANGLE) roll_active = -EFFECTIVE_MAX_ANGLE;
+	if (pitch_active > EFFECTIVE_MAX_ANGLE) pitch_active = EFFECTIVE_MAX_ANGLE;
+	if (pitch_active < -EFFECTIVE_MAX_ANGLE) pitch_active = -EFFECTIVE_MAX_ANGLE;
+
+	/* Map angle to screen coordinate
+	 * -55° (60° - 5° deadzone) → 0 (left/top edge)
+	 *   0° → 16383 (center)
+	 * +55° → 32767 (right/bottom edge)
+	 */
+
+	/* X position (INVERTED: positive roll → left, negative roll → right) */
+	float x_normalized = -roll_active / EFFECTIVE_MAX_ANGLE;  /* -1.0 to +1.0 */
+	float x_float = SCREEN_CENTER + (x_normalized * SCREEN_CENTER);
+
+	/* Y position (positive pitch → down, negative pitch → up) */
+	float y_normalized = pitch_active / EFFECTIVE_MAX_ANGLE;  /* -1.0 to +1.0 */
+	float y_float = SCREEN_CENTER + (y_normalized * SCREEN_CENTER);
+
+	/* Clamp to valid range and convert to uint16_t */
+	if (x_float < 0.0f) x_float = 0.0f;
+	if (x_float > SCREEN_MAX) x_float = SCREEN_MAX;
+	if (y_float < 0.0f) y_float = 0.0f;
+	if (y_float > SCREEN_MAX) y_float = SCREEN_MAX;
+
+	*abs_x = (uint16_t)x_float;
+	*abs_y = (uint16_t)y_float;
 }
 
 /* USB HID callback functions */
@@ -143,9 +230,15 @@ static const struct hid_ops ops = {
 };
 
 /* Function to send mouse movement report */
-static void send_mouse_report(int8_t x, int8_t y, uint8_t buttons)
+static void send_mouse_report(uint16_t abs_x, uint16_t abs_y, uint8_t buttons)
 {
-	uint8_t report[MOUSE_REPORT_COUNT] = {buttons, x, y, 0};
+	uint8_t report[MOUSE_REPORT_COUNT];
+
+	report[MOUSE_BTN_REPORT_IDX] = buttons;
+	report[MOUSE_X_LOW_IDX] = abs_x & 0xFF;           /* Low byte */
+	report[MOUSE_X_HIGH_IDX] = (abs_x >> 8) & 0x7F;   /* High byte (15-bit) */
+	report[MOUSE_Y_LOW_IDX] = abs_y & 0xFF;           /* Low byte */
+	report[MOUSE_Y_HIGH_IDX] = (abs_y >> 8) & 0x7F;   /* High byte (15-bit) */
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
 		LOG_WRN("Failed to queue mouse report");
@@ -195,10 +288,10 @@ void event_handler(struct esb_evt const *event)
 			LOG_DBG("Euler angles: roll=%.3f rad, pitch=%.3f rad, yaw=%.3f rad",
 				roll, pitch, yaw);
 
-			/* Convert Euler angles to mouse displacement */
-			int8_t mouse_x, mouse_y;
-			euler_to_mouse_displacement(roll, pitch, &mouse_x, &mouse_y);
-			LOG_DBG("Mouse displacement: X=%d, Y=%d", mouse_x, mouse_y);
+			/* Convert Euler angles to absolute screen position */
+			uint16_t abs_x, abs_y;
+			euler_to_absolute_position(roll, pitch, &abs_x, &abs_y);
+			LOG_DBG("Absolute position: X=%u, Y=%u", abs_x, abs_y);
 
 			leds_update(sensor_data->btn_state);
 
@@ -221,10 +314,10 @@ void event_handler(struct esb_evt const *event)
 				LOG_INF("Right mouse button: RELEASED");
 			}
 
-			/* Send mouse report with quaternion-based movement and button state */
-			send_mouse_report(mouse_x, mouse_y, mouse_buttons);
-			LOG_INF("Sending mouse report: X=%d, Y=%d, buttons=0x%02x",
-				mouse_x, mouse_y, mouse_buttons);
+			/* Send mouse report with absolute positioning and button state */
+			send_mouse_report(abs_x, abs_y, mouse_buttons);
+			LOG_INF("Sending mouse report: X=%u, Y=%u, buttons=0x%02x",
+				abs_x, abs_y, mouse_buttons);
 		} else {
 			LOG_ERR("Error while reading rx packet");
 		}
@@ -439,11 +532,14 @@ int main(void)
 			continue;
 		}
 
-		LOG_INF("Sending HID report: btn=%d, x=%d, y=%d, wheel=%d",
+		/* Reconstruct 16-bit absolute coordinates for logging */
+		uint16_t abs_x = report[MOUSE_X_LOW_IDX] | (report[MOUSE_X_HIGH_IDX] << 8);
+		uint16_t abs_y = report[MOUSE_Y_LOW_IDX] | (report[MOUSE_Y_HIGH_IDX] << 8);
+
+		LOG_INF("Sending HID report: btn=%d, abs_x=%u, abs_y=%u",
 			report[MOUSE_BTN_REPORT_IDX],
-			(int8_t)report[MOUSE_X_REPORT_IDX],
-			(int8_t)report[MOUSE_Y_REPORT_IDX],
-			(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
+			abs_x,
+			abs_y);
 
 		/* Send HID report over USB */
 		err = hid_int_ep_write(hid_dev, report, MOUSE_REPORT_COUNT, NULL);
