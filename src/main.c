@@ -30,19 +30,17 @@
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/sys/util.h>
 #include <string.h>
+#include <math.h>
 
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 /* Sensor data packet structure */
 typedef struct {
-	uint32_t sequence_num;
 	uint8_t btn_state;      /* 3 bits: btn1, btn2, btn3 (1=pressed, 0=released) */
-	uint32_t timestamp_ms;
-	/* Future expansion:
-	 * uint8_t cap_state;
-	 * int16_t imu_accel_x, y, z;
-	 * int16_t imu_gyro_x, y, z;
-	 */
+	int16_t quat_w;         /* Quaternion w component (scaled by 32767) */
+	int16_t quat_x;         /* Quaternion x component (scaled by 32767) */
+	int16_t quat_y;         /* Quaternion y component (scaled by 32767) */
+	int16_t quat_z;         /* Quaternion z component (scaled by 32767) */
 } __attribute__((packed)) sensor_data_t;
 
 static struct esb_payload rx_payload;
@@ -75,6 +73,57 @@ static void leds_update(uint8_t value)
 	/* Toggle LED to indicate packet reception */
 	led_on = !led_on;
 	gpio_pin_set_dt(&led, led_on);
+}
+
+/**
+ * Convert quaternion to Euler angles (roll, pitch, yaw) using ZYX sequence.
+ */
+static void quat_to_euler(float qw, float qx, float qy, float qz,
+                          float *roll, float *pitch, float *yaw)
+{
+	/* Roll (rotation around X-axis) */
+	*roll = atan2f(2.0f * (qy * qz + qw * qx),
+	               1.0f - 2.0f * (qx * qx + qy * qy));
+
+	/* Pitch (rotation around Y-axis) - clamp input to prevent domain errors */
+	float pitch_input = 2.0f * (qw * qy - qx * qz);
+	if (pitch_input > 1.0f) pitch_input = 1.0f;
+	if (pitch_input < -1.0f) pitch_input = -1.0f;
+	*pitch = asinf(pitch_input);
+
+	/* Yaw (rotation around Z-axis) - calculated but not used for mouse */
+	*yaw = atan2f(2.0f * (qx * qy + qw * qz),
+	              1.0f - 2.0f * (qy * qy + qz * qz));
+}
+
+/**
+ * Convert Euler angles to mouse displacement with deadzone and scaling.
+ */
+static void euler_to_mouse_displacement(float roll, float pitch,
+                                        int8_t *mouse_x, int8_t *mouse_y)
+{
+	const float DEADZONE = 0.05f;      /* ±0.05 radians (~±3 degrees) */
+	const float SENSITIVITY = 20.0f;   /* displacement = angle * 20 */
+
+	/* Apply deadzone to roll (X-axis) */
+	float roll_filtered = (fabsf(roll) < DEADZONE) ? 0.0f : roll;
+
+	/* Apply deadzone to pitch (Y-axis) */
+	float pitch_filtered = (fabsf(pitch) < DEADZONE) ? 0.0f : pitch;
+
+	/* Scale angles to mouse displacement */
+	float x_float = roll_filtered * SENSITIVITY;
+	float y_float = pitch_filtered * SENSITIVITY;
+
+	/* Clamp to int8_t range (-128 to +127) */
+	if (x_float > 127.0f) x_float = 127.0f;
+	if (x_float < -128.0f) x_float = -128.0f;
+	if (y_float > 127.0f) y_float = 127.0f;
+	if (y_float < -128.0f) y_float = -128.0f;
+
+	/* Convert to int8_t (invert X axis) */
+	*mouse_x = -(int8_t)x_float;
+	*mouse_y = (int8_t)y_float;
 }
 
 /* USB HID callback functions */
@@ -129,12 +178,27 @@ void event_handler(struct esb_evt const *event)
 			uint8_t btn2 = (sensor_data->btn_state >> 1) & 0x01;  /* bit 1 */
 			uint8_t btn3 = (sensor_data->btn_state >> 2) & 0x01;  /* bit 2 */
 
-			/* Log received packet data */
-			LOG_INF("Packet received - seq: %u, btn_state: 0x%02x (btn1=%d, btn2=%d, btn3=%d), timestamp: %u ms",
-				sensor_data->sequence_num,
-				sensor_data->btn_state,
-				btn1, btn2, btn3,
-				sensor_data->timestamp_ms);
+			/* Convert quaternion int16_t to normalized float (-1.0 to 1.0) */
+			float qw = (float)sensor_data->quat_w / 32767.0f;
+			float qx = (float)sensor_data->quat_x / 32767.0f;
+			float qy = (float)sensor_data->quat_y / 32767.0f;
+			float qz = (float)sensor_data->quat_z / 32767.0f;
+
+			/* Log received quaternion data */
+			LOG_INF("Packet received - btn_state: 0x%02x (btn1=%d, btn2=%d, btn3=%d)",
+				sensor_data->btn_state, btn1, btn2, btn3);
+			LOG_DBG("Quaternion: w=%.3f, x=%.3f, y=%.3f, z=%.3f", qw, qx, qy, qz);
+
+			/* Convert quaternion to Euler angles */
+			float roll, pitch, yaw;
+			quat_to_euler(qw, qx, qy, qz, &roll, &pitch, &yaw);
+			LOG_DBG("Euler angles: roll=%.3f rad, pitch=%.3f rad, yaw=%.3f rad",
+				roll, pitch, yaw);
+
+			/* Convert Euler angles to mouse displacement */
+			int8_t mouse_x, mouse_y;
+			euler_to_mouse_displacement(roll, pitch, &mouse_x, &mouse_y);
+			LOG_DBG("Mouse displacement: X=%d, Y=%d", mouse_x, mouse_y);
 
 			leds_update(sensor_data->btn_state);
 
@@ -157,8 +221,10 @@ void event_handler(struct esb_evt const *event)
 				LOG_INF("Right mouse button: RELEASED");
 			}
 
-			/* Send mouse report with current button state */
-			send_mouse_report(0, 0, mouse_buttons);
+			/* Send mouse report with quaternion-based movement and button state */
+			send_mouse_report(mouse_x, mouse_y, mouse_buttons);
+			LOG_INF("Sending mouse report: X=%d, Y=%d, buttons=0x%02x",
+				mouse_x, mouse_y, mouse_buttons);
 		} else {
 			LOG_ERR("Error while reading rx packet");
 		}
