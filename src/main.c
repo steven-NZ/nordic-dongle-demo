@@ -37,6 +37,7 @@ LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 /* Sensor data packet structure */
 typedef struct {
 	uint8_t btn_state;      /* 3 bits: btn1, btn2, btn3 (1=pressed, 0=released) */
+	uint8_t mgc_state;      /* MGC touch + airwheel data */
 	int16_t quat_w;         /* Quaternion w component (scaled by 32767) */
 	int16_t quat_x;         /* Quaternion x component (scaled by 32767) */
 	int16_t quat_y;         /* Quaternion y component (scaled by 32767) */
@@ -57,7 +58,8 @@ static bool led_on = false;
 #define MOUSE_X_HIGH_IDX	2	/* X position high byte */
 #define MOUSE_Y_LOW_IDX		3	/* Y position low byte */
 #define MOUSE_Y_HIGH_IDX	4	/* Y position high byte */
-#define MOUSE_REPORT_COUNT	5
+#define MOUSE_WHEEL_IDX		5	/* Scroll wheel */
+#define MOUSE_REPORT_COUNT	6
 
 /* HID Report Descriptor for absolute positioning digitizer */
 static const uint8_t hid_report_desc[] = {
@@ -98,6 +100,14 @@ static const uint8_t hid_report_desc[] = {
 	0x75, 0x10,        //     Report Size (16 bits)
 	0x95, 0x01,        //     Report Count (1)
 	0x81, 0x02,        //     Input (Data, Variable, Absolute)
+
+	// Scroll Wheel (Relative, 8-bit, -127 to +127)
+	0x09, 0x38,        //     Usage (Wheel)
+	0x15, 0x81,        //     Logical Minimum (-127)
+	0x25, 0x7F,        //     Logical Maximum (127)
+	0x75, 0x08,        //     Report Size (8 bits)
+	0x95, 0x01,        //     Report Count (1)
+	0x81, 0x06,        //     Input (Data, Variable, Relative)
 
 	0xC0,              //   End Collection (Physical)
 	0xC0               // End Collection (Application)
@@ -230,7 +240,7 @@ static const struct hid_ops ops = {
 };
 
 /* Function to send mouse movement report */
-static void send_mouse_report(uint16_t abs_x, uint16_t abs_y, uint8_t buttons)
+static void send_mouse_report(uint16_t abs_x, uint16_t abs_y, uint8_t buttons, int8_t wheel)
 {
 	uint8_t report[MOUSE_REPORT_COUNT];
 
@@ -239,11 +249,22 @@ static void send_mouse_report(uint16_t abs_x, uint16_t abs_y, uint8_t buttons)
 	report[MOUSE_X_HIGH_IDX] = (abs_x >> 8) & 0x7F;   /* High byte (15-bit) */
 	report[MOUSE_Y_LOW_IDX] = abs_y & 0xFF;           /* Low byte */
 	report[MOUSE_Y_HIGH_IDX] = (abs_y >> 8) & 0x7F;   /* High byte (15-bit) */
+	report[MOUSE_WHEEL_IDX] = (uint8_t)wheel;         /* Wheel (signed) */
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
 		LOG_WRN("Failed to queue mouse report");
 	}
 }
+
+/* MGC state bit field definitions */
+#define MGC_TOUCH_N         (1 << 0)  /* North electrode */
+#define MGC_TOUCH_S         (1 << 1)  /* South electrode */
+#define MGC_TOUCH_E         (1 << 2)  /* East electrode */
+#define MGC_TOUCH_W         (1 << 3)  /* West electrode */
+#define MGC_AIRWHEEL_ACTIVE (1 << 4)  /* Airwheel gesture active */
+#define MGC_AIRWHEEL_DIR    (1 << 5)  /* Direction: 1=CW, 0=CCW */
+#define MGC_AIRWHEEL_VEL_MASK 0xC0    /* Bits 6-7: velocity level */
+#define MGC_AIRWHEEL_VEL_SHIFT 6
 
 void event_handler(struct esb_evt const *event)
 {
@@ -295,29 +316,93 @@ void event_handler(struct esb_evt const *event)
 
 			leds_update(sensor_data->btn_state);
 
-			/* Build HID mouse button byte:
-			 * bit 0 = left button (btn1)
-			 * bit 1 = right button (btn2)
+			/* Parse MGC state */
+			uint8_t mgc = sensor_data->mgc_state;
+			uint8_t airwheel_active = mgc & MGC_AIRWHEEL_ACTIVE;
+			uint8_t airwheel_cw = mgc & MGC_AIRWHEEL_DIR;
+			uint8_t airwheel_vel = (mgc & MGC_AIRWHEEL_VEL_MASK) >> MGC_AIRWHEEL_VEL_SHIFT;
+
+			LOG_DBG("MGC state: 0x%02x (N=%d S=%d E=%d W=%d AW_active=%d dir=%s vel=%d)",
+				mgc,
+				(mgc & MGC_TOUCH_N)?1:0,
+				(mgc & MGC_TOUCH_S)?1:0,
+				(mgc & MGC_TOUCH_E)?1:0,
+				(mgc & MGC_TOUCH_W)?1:0,
+				airwheel_active?1:0,
+				airwheel_cw?"CW":"CCW",
+				airwheel_vel);
+
+			/* Calculate scroll wheel value */
+			int8_t wheel = 0;
+
+			/* Touch gesture scrolling - edge-triggered */
+			static uint8_t prev_touch_state = 0;
+			uint8_t touch_state = mgc & 0x0F;  /* Lower 4 bits = touch electrodes */
+			uint8_t touch_edge = touch_state & ~prev_touch_state;  /* Rising edge */
+			uint8_t touch_n_edge = touch_edge & MGC_TOUCH_N;
+			uint8_t touch_s_edge = touch_edge & MGC_TOUCH_S;
+
+			if (touch_edge & MGC_TOUCH_E) {
+				wheel = 10;  /* Scroll up */
+				LOG_INF("Touch East → Scroll up (wheel=%d)", wheel);
+			}
+			if (touch_edge & MGC_TOUCH_W) {
+				wheel = -10;  /* Scroll down */
+				LOG_INF("Touch West → Scroll down (wheel=%d)", wheel);
+			}
+
+			prev_touch_state = touch_state;
+
+			/* Airwheel scrolling - continuous */
+			if (airwheel_active) {
+				const int8_t vel_scale[] = {0, 5, 10, 20};
+				int8_t scroll_amount = vel_scale[airwheel_vel];
+
+				if (airwheel_cw) {
+					wheel += scroll_amount;  /* CW = scroll up */
+					LOG_INF("Airwheel CW: vel=%d → scroll up (wheel=%d)", airwheel_vel, wheel);
+				} else {
+					wheel -= scroll_amount;  /* CCW = scroll down */
+					LOG_INF("Airwheel CCW: vel=%d → scroll down (wheel=%d)", airwheel_vel, wheel);
+				}
+			}
+
+			/* Clamp wheel to valid range */
+			if (wheel > 127) wheel = 127;
+			if (wheel < -127) wheel = -127;
+
+			/* Build HID mouse button byte with OR logic (touch OR physical buttons):
+			 * bit 0 = left button (btn1 OR touch N)
+			 * bit 1 = right button (btn2 OR touch S)
+			 * bit 2 = middle button (btn3)
 			 */
 			uint8_t mouse_buttons = 0;
-			if (btn1) {
-				mouse_buttons |= 0x01;  /* Left button pressed */
+
+			/* Physical button 1 OR Touch North → Left click */
+			if (btn1 || touch_n_edge) {
+				mouse_buttons |= 0x01;
 				LOG_INF("Left mouse button: PRESSED");
 			} else {
 				LOG_INF("Left mouse button: RELEASED");
 			}
 
-			if (btn2) {
-				mouse_buttons |= 0x02;  /* Right button pressed */
+			/* Physical button 2 OR Touch South → Right click */
+			if (btn2 || touch_s_edge) {
+				mouse_buttons |= 0x02;
 				LOG_INF("Right mouse button: PRESSED");
 			} else {
 				LOG_INF("Right mouse button: RELEASED");
 			}
 
+			/* Physical button 3 → Middle click (optional) */
+			if (btn3) {
+				mouse_buttons |= 0x04;
+			}
+
 			/* Send mouse report with absolute positioning and button state */
-			send_mouse_report(abs_x, abs_y, mouse_buttons);
-			LOG_INF("Sending mouse report: X=%u, Y=%u, buttons=0x%02x",
-				abs_x, abs_y, mouse_buttons);
+			send_mouse_report(abs_x, abs_y, mouse_buttons, wheel);
+			LOG_INF("Sending mouse report: X=%u, Y=%u, buttons=0x%02x, wheel=%d",
+				abs_x, abs_y, mouse_buttons, wheel);
 		} else {
 			LOG_ERR("Error while reading rx packet");
 		}
