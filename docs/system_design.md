@@ -24,12 +24,16 @@ A wireless receiver dongle that receives sensor data (nordic airpad) via Enhance
 
 **LED Feedback**: GPIO LED toggles on each received ESB packet for visual confirmation.
 
+**Vibration Feedback**: Haptic response sent to transmitter via ESB ACK packets with intensity control (0-255). Each touch electrode triggers different intensity levels: North=255, East=220, South=200, West=180.
+
 ## Data Flow
 
 ```
 ESB RX Interrupt → Parse sensor_data_t → Process (quaternion→Euler→position,
 touch→keys, buttons, scroll) → Queue reports → Main loop dequeues →
 USB HID write (Report ID 1: Mouse, Report ID 2: Keyboard)
+                 ↓
+         Update vibration intensity → Build response_data_t → ESB ACK TX
 ```
 
 ## Packet Structure
@@ -45,11 +49,20 @@ struct sensor_data_t {
 } // 14 bytes total
 ```
 
+**ESB Response Payload** (sent via ACK):
+```c
+struct response_data_t {
+    uint8_t vibration_intensity;  // 0=off, 1-255=motor intensity
+    int8_t  reserved[7];          // Future expansion
+} // 8 bytes total
+```
+
 ## Key Configuration
 
 - **ESB**: ESB_PROTOCOL_ESB_DPL, 1 Mbps, PRX mode, +8 dBm
 - **IMU**: MAX_ANGLE=60°, SMOOTHING_FACTOR=0.5, CENTER_DEADZONE=±5°
 - **Screen**: SCREEN_MAX=32767 (16-bit absolute positioning)
+- **Vibration Intensity**: Touch N=255, E=220, S=200, W=180 (0=off)
 - **Demo Addresses**: base_addr_0={0xE7,0xE7,0xE7,0xE7}, base_addr_1={0xC2,0xC2,0xC2,0xC2}
 
 ## Development Notes
