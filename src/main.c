@@ -46,8 +46,8 @@ typedef struct {
 
 /* Response payload structure sent back to transmitter via ESB ACK */
 typedef struct {
-	uint8_t vibration_enable;      /* 0=off, 1=on */
-	uint8_t reserved[7];           /* Reserved for future expansion */
+	uint8_t vibration_intensity;   /* 0-255 (0=off, 1-255=motor intensity) */
+	int8_t reserved[7];            /* Reserved for future expansion */
 } __attribute__((packed)) response_data_t;
 
 static struct esb_payload rx_payload;
@@ -99,7 +99,7 @@ typedef struct {
 static kbd_state_t kbd_state = {0};
 
 /* Vibration state tracking */
-static bool vibration_active = false;
+static uint8_t vibration_intensity = 0;
 
 /* MGC state bit packing (2-byte layout) */
 /* Byte 1 (Touch) - Lower 8 bits */
@@ -351,14 +351,14 @@ static void process_keyboard_touches(uint16_t mgc_state)
 		send_keyboard_report(HID_KEY_A);
 		LOG_INF("Touch N pressed → Keyboard 'a'");
 
-		/* Turn vibration ON when touched */
-		vibration_active = true;
+		/* Set vibration intensity to 100% (255) when touched */
+		vibration_intensity = 255;
 	} else if (!touch_n_active && kbd_state.touch_n_pressed) {
 		send_keyboard_report(0x00);
 		LOG_INF("Touch N released → Keyboard release");
 
 		/* Turn vibration OFF when released */
-		vibration_active = false;
+		vibration_intensity = 0;
 	}
 	kbd_state.touch_n_pressed = touch_n_active;
 
@@ -367,14 +367,14 @@ static void process_keyboard_touches(uint16_t mgc_state)
 		send_keyboard_report(HID_KEY_B);
 		LOG_INF("Touch S pressed → Keyboard 'b'");
 
-		/* Turn vibration ON when touched */
-		vibration_active = true;
+		/* Set vibration intensity to 80% (204) when touched */
+		vibration_intensity = 200;
 	} else if (!touch_s_active && kbd_state.touch_s_pressed) {
 		send_keyboard_report(0x00);
 		LOG_INF("Touch S released → Keyboard release");
 
 		/* Turn vibration OFF when released */
-		vibration_active = false;
+		vibration_intensity = 0;
 	}
 	kbd_state.touch_s_pressed = touch_s_active;
 
@@ -383,14 +383,14 @@ static void process_keyboard_touches(uint16_t mgc_state)
 		send_keyboard_report(HID_KEY_C);
 		LOG_INF("Touch E pressed → Keyboard 'c'");
 
-		/* Turn vibration ON when touched */
-		vibration_active = true;
+		/* Set vibration intensity to 90% (230) when touched */
+		vibration_intensity = 220;
 	} else if (!touch_e_active && kbd_state.touch_e_pressed) {
 		send_keyboard_report(0x00);
 		LOG_INF("Touch E released → Keyboard release");
 
 		/* Turn vibration OFF when released */
-		vibration_active = false;
+		vibration_intensity = 0;
 	}
 	kbd_state.touch_e_pressed = touch_e_active;
 
@@ -399,14 +399,14 @@ static void process_keyboard_touches(uint16_t mgc_state)
 		send_keyboard_report(HID_KEY_D);
 		LOG_INF("Touch W pressed → Keyboard 'd'");
 
-		/* Turn vibration ON when touched */
-		vibration_active = true;
+		/* Set vibration intensity to 70% (179) when touched */
+		vibration_intensity = 180;
 	} else if (!touch_w_active && kbd_state.touch_w_pressed) {
 		send_keyboard_report(0x00);
 		LOG_INF("Touch W released → Keyboard release");
 
 		/* Turn vibration OFF when released */
-		vibration_active = false;
+		vibration_intensity = 0;
 	}
 	kbd_state.touch_w_pressed = touch_w_active;
 }
@@ -415,14 +415,14 @@ static void process_keyboard_touches(uint16_t mgc_state)
  * Update ESB TX payload with vibration command.
  * This payload is automatically sent back with the next ACK.
  *
- * @param enable 1 to activate vibration, 0 to disable
+ * @param intensity Vibration intensity (0-255, 0=off, 1-255=motor intensity)
  */
-static void update_vibration_command(uint8_t enable)
+static void update_vibration_command(uint8_t intensity)
 {
 	response_data_t response;
 
 	/* Build response payload */
-	response.vibration_enable = enable;
+	response.vibration_intensity = intensity;
 	memset(response.reserved, 0, sizeof(response.reserved));
 
 	/* Update tx_payload data buffer */
@@ -434,7 +434,7 @@ static void update_vibration_command(uint8_t enable)
 	if (err) {
 		LOG_ERR("Failed to update vibration ACK payload, err %d", err);
 	} else {
-		LOG_DBG("Vibration command: enable=%d", enable);
+		LOG_DBG("Vibration command: intensity=%d", intensity);
 	}
 }
 
@@ -560,7 +560,7 @@ void event_handler(struct esb_evt const *event)
 			process_keyboard_touches(mgc);
 
 			/* Always update vibration state in ACK payload to handle packet loss */
-			update_vibration_command(vibration_active ? 1 : 0);
+			update_vibration_command(vibration_intensity);
 
 			/* Send mouse report with absolute positioning and button state */
 			send_mouse_report(abs_x, abs_y, mouse_buttons, wheel);
